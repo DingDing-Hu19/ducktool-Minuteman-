@@ -1,7 +1,14 @@
 # ============================================================
-# 肉鸭采食行为 + 体重 + 生产性能综合分析工具  Python V5.1
+# 肉鸭采食行为 + 体重 + 生产性能综合分析工具  Python V5.2
 # ============================================================
-# V5.1 内存优化版：
+# V5.2 更新：
+#   - 支持 .xls（老版二进制）与 .xlsx（新版）自动分流引擎
+#     .xls  -> xlrd==2.0.1
+#     .xlsx -> openpyxl
+#   - QC 表新增 engine 信息，便于排查
+#   - 修复 .xls 上传报 "File is not a zip file"
+#
+# V5.1 内存优化：
 #   - Excel 读取后立即降类型（float32 / category / datetime）
 #   - ExcelFile 用 try/finally 关闭
 #   - 周异常值检测不再 merge，改用 map 广播
@@ -161,6 +168,26 @@ _NUMERIC_HINTS = (
 _CATEGORY_HINTS = ("群组", "栋舍", "栏圈", "group", "house", "pen", "耳标", "animal", "id", "tag")
 
 
+# ============================================================
+# ★ V5.2 新增：按文件名后缀选择引擎
+# ============================================================
+def _pick_engine(filename_or_path):
+    """根据文件名后缀选择读取引擎。
+    .xls          -> xlrd（需 pip install xlrd==2.0.1）
+    .xlsx/.xlsm   -> openpyxl
+    其他           -> 默认 openpyxl
+    """
+    name = str(filename_or_path).lower()
+    if name.endswith(".xls"):
+        return "xlrd"
+    return "openpyxl"
+
+
+def _is_openpyxl_compatible(filename_or_path):
+    """openpyxl 只支持 xlsx/xlsm；.xls 不能走 openpyxl 只读表头检测。"""
+    return not str(filename_or_path).lower().endswith(".xls")
+
+
 def clean_names(nms):
     def _clean_one(n):
         s = str(n)
@@ -208,7 +235,7 @@ def sheet_matches_dataset(header_df, dataset_type, return_detail=False):
 
 
 # ============================================================
-# 表头检测（openpyxl 只读，不再建临时 DataFrame）
+# 表头检测（仅 xlsx 走 openpyxl 只读）
 # ============================================================
 def detect_header_row_openpyxl(path_or_buf, sheet_name, dataset_type, max_scan=6):
     pats = FEED_PATTERNS if dataset_type == "feed" else WEIGHT_PATTERNS
@@ -366,16 +393,25 @@ def _downcast_object(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def read_excel_clean(path_or_buf, sheet_name=0, dataset_type=None):
+def read_excel_clean(path_or_buf, sheet_name=0, dataset_type=None, source_name=""):
+    """读取单个 sheet，自动按 source_name 后缀选引擎。"""
     header_row = 0
-    if dataset_type:
+    engine = _pick_engine(source_name)
+
+    # 只有 xlsx 才做只读表头探测
+    if dataset_type and engine == "openpyxl":
         try:
             header_row = detect_header_row_openpyxl(path_or_buf, sheet_name, dataset_type)
         except Exception:
             header_row = 0
 
-    df = pd.read_excel(path_or_buf, sheet_name=sheet_name,
-                       header=header_row, dtype=object, engine="openpyxl")
+    df = pd.read_excel(
+        path_or_buf,
+        sheet_name=sheet_name,
+        header=header_row,
+        dtype=object,
+        engine=engine,
+    )
     df = df.dropna(how="all").dropna(axis=1, how="all")
     df.columns = clean_names(df.columns)
     df = df.reset_index(drop=True)
@@ -392,22 +428,26 @@ def read_matching_excel_files(files, dataset_type):
     data_list, qc_list = [], []
 
     for name, raw in files:
+        engine = _pick_engine(name)  # ← 按原始文件名选引擎
+
         xls = None
         try:
-            xls = pd.ExcelFile(io.BytesIO(raw), engine="openpyxl")
+            xls = pd.ExcelFile(io.BytesIO(raw), engine=engine)
         except Exception as e:
             qc_list.append({"数据集": dataset_label, "Source_File": name, "Source_Sheet": "-",
-                            "状态": "跳过：文件读取失败", "读取记录数": 0, "说明": str(e)})
+                            "状态": "跳过：文件读取失败", "读取记录数": 0,
+                            "说明": f"engine={engine}；{e}"})
             continue
 
         try:
             for sheet in xls.sheet_names:
                 try:
-                    header = pd.read_excel(xls, sheet_name=sheet, nrows=6, engine="openpyxl")
+                    header = pd.read_excel(xls, sheet_name=sheet, nrows=6, engine=engine)
                     header.columns = clean_names(header.columns)
                 except Exception as e:
                     qc_list.append({"数据集": dataset_label, "Source_File": name, "Source_Sheet": sheet,
-                                    "状态": "跳过：工作表读取失败", "读取记录数": 0, "说明": str(e)})
+                                    "状态": "跳过：工作表读取失败", "读取记录数": 0,
+                                    "说明": f"engine={engine}；{e}"})
                     continue
 
                 matched, detail = sheet_matches_dataset(header, dataset_type, return_detail=True)
@@ -417,21 +457,23 @@ def read_matching_excel_files(files, dataset_type):
                     qc_list.append({
                         "数据集": dataset_label, "Source_File": name, "Source_Sheet": sheet,
                         "状态": "跳过：必需字段缺失", "读取记录数": 0,
-                        "说明": f"缺失字段: {missing}；候选列: {list(detail.keys())}",
+                        "说明": f"engine={engine} | 缺失字段: {missing}",
                     })
                     continue
 
                 try:
-                    tmp = read_excel_clean(xls, sheet, dataset_type=dataset_type)
+                    # ← 传 source_name 让 read_excel_clean 知道后缀
+                    tmp = read_excel_clean(xls, sheet, dataset_type=dataset_type, source_name=name)
                 except Exception as e:
                     qc_list.append({"数据集": dataset_label, "Source_File": name, "Source_Sheet": sheet,
-                                    "状态": "跳过：工作表读取失败", "读取记录数": 0, "说明": str(e)})
+                                    "状态": "跳过：工作表读取失败", "读取记录数": 0,
+                                    "说明": f"engine={engine}；{e}"})
                     continue
 
                 if len(tmp) == 0:
                     qc_list.append({"数据集": dataset_label, "Source_File": name, "Source_Sheet": sheet,
                                     "状态": "跳过：工作表为空", "读取记录数": 0,
-                                    "说明": "字段匹配，但没有有效记录"})
+                                    "说明": f"engine={engine} | 字段匹配，但没有有效记录"})
                     del tmp
                     continue
 
@@ -444,7 +486,8 @@ def read_matching_excel_files(files, dataset_type):
                 qc_list.append({
                     "数据集": dataset_label, "Source_File": name, "Source_Sheet": sheet,
                     "状态": "已读取", "读取记录数": len(tmp),
-                    "说明": f"匹配字段: {matched_ok}" + (f" | 缺失(将置空): {matched_ng}" if matched_ng else ""),
+                    "说明": f"engine={engine} | 匹配字段: {matched_ok}"
+                            + (f" | 缺失(将置空): {matched_ng}" if matched_ng else ""),
                 })
         finally:
             if xls is not None:
@@ -1057,9 +1100,10 @@ def build_excel(result_obj, keys, params_info=None):
 # ============================================================
 # 侧边栏
 # ============================================================
-st.sidebar.title("肉鸭综合分析工具 V5.1")
+st.sidebar.title("肉鸭综合分析工具 V5.2")
 
 st.sidebar.header("① 数据上传")
+st.sidebar.caption("支持 .xlsx / .xls；.xls 需安装 xlrd==2.0.1")
 feed_files = st.sidebar.file_uploader("采食原始数据（可上传 N 个 Excel）",
                                        type=["xlsx", "xls"], accept_multiple_files=True)
 weight_files = st.sidebar.file_uploader("体重原始数据（可上传 N 个 Excel）",
@@ -1157,7 +1201,7 @@ if st.session_state.result:
         st.sidebar.download_button(
             label=f"📥 导出所选 Excel（{len(_keys)} 个类别）",
             data=_xls_bytes,
-            file_name=f"肉鸭分析_V5.1_{_ts}.xlsx",
+            file_name=f"肉鸭分析_V5.2_{_ts}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
             key="sidebar_dl_all",
@@ -1190,7 +1234,7 @@ def run_analysis():
 
     feed_raw = standardize_feed(feed_original)
     bw_raw = standardize_bw(weight_original)
-    del feed_original, weight_original  # 释放原始 object 大表
+    del feed_original, weight_original
 
     if len(feed_raw) > 0 and feed_raw["Feed_Duration_sec"].isna().all():
         st.warning("⚠️ 采食时长字段未识别，FR/TFD/AFBD 等指标将为空。")
@@ -1246,7 +1290,6 @@ def run_analysis():
     bw_deleted_time = bw_before_time - len(bw_time)
     del feed_complete, bw_complete
 
-    # 合并周信息，不再 concat
     feed_time = feed_time.reset_index(drop=True)
     wk = make_experimental_week(feed_time["Time1"], end_dt, week_length)
     feed_time["Experimental_Day"] = wk["Experimental_Day"].values
@@ -1503,553 +1546,9 @@ with tabs[0]:
 
     **采食时长格式**：`1.09:33:38`、`09:33:38`、`33:33:38`、`09:33` 均可识别。
 
-    **V5.1 内存优化**
-    - Excel 读取后立即降类型（float32 / category / datetime），内存占用降 60%~80%
-    - ExcelFile 用 try/finally 关闭，避免句柄与内部缓存堆积
-    - 周异常值检测不再 merge，改用 map 广播，省一份整表拷贝
-    - Excel 导出 write_only + 逐行 yield，导出峰值内存 ≈ 单张表
-    - 主流程合并周信息不再 concat，直接 assign 新列
-    - 昼夜划分向量化，不再 apply + copy
-    - 保留 V5.0 全部功能（侧边栏一键导出、Tab 合并、QC 提示等）
-    """)
+    **V5.2 更新**
+    - ✅ **支持 .xls 文件**（自动根据后缀选 xlrd / openpyxl），解决 "File is not a zip file"
+    - QC 表新增 `engine` 信息，便于排查
+    - 保留 V5.1 全部内存优化（float32 / category / write_only 导出 / map 广播 / 向量化昼夜）
 
-    st.info("如果上传后报错，请切换到『QC』标签页查看『读取工作表记录』，"
-            "该表会告诉你每个工作表匹配到了哪些字段、缺失哪些字段。"
-            "如遇 .xls 读取失败，请先执行：pip install xlrd")
-
-
-with tabs[1]:
-    st.header("数据清洗 QC")
-
-    if "read_qc" in result and len(result["read_qc"]) > 0:
-        rq = result["read_qc"]
-        failed = rq[rq["状态"].astype(str).str.contains("跳过", na=False)]
-        if len(failed) > 0:
-            st.warning(
-                f"⚠️ 有 {len(failed)} 个工作表被跳过。请看下方『读取工作表记录』的"
-                "『状态』和『说明』列：说明会告诉你每个 sheet 缺了哪些字段、"
-                "以及 pandas 实际读到的候选列名。"
-            )
-
-    if "qc_summary" in result and len(result["qc_summary"]) > 0:
-        st.subheader("整体 QC")
-        st.dataframe(result["qc_summary"], use_container_width=True)
-    if "datetime_qc" in result:
-        st.subheader("日期时间解析 QC")
-        st.dataframe(result["datetime_qc"], use_container_width=True)
-    if "read_qc" in result:
-        st.subheader("读取工作表记录")
-        st.dataframe(result["read_qc"], use_container_width=True)
-    if "week_summary" in result and len(result["week_summary"]) > 0:
-        st.subheader("周次数据量检查")
-        st.dataframe(result["week_summary"], use_container_width=True)
-    if "na_qc" in result:
-        st.subheader("重要字段 NA")
-        st.dataframe(result["na_qc"], use_container_width=True)
-    if "feed_week_stats" in result:
-        st.subheader("采食时长周内 QC")
-        st.dataframe(result["feed_week_stats"].round(4), use_container_width=True)
-    if "bw_week_stats" in result:
-        st.subheader("体重周内 QC")
-        st.dataframe(result["bw_week_stats"].round(4), use_container_width=True)
-    if "feed_outlier" in result:
-        st.subheader("异常采食记录")
-        st.dataframe(result["feed_outlier"], use_container_width=True)
-    if "bw_outlier" in result:
-        st.subheader("异常体重记录")
-        st.dataframe(result["bw_outlier"], use_container_width=True)
-
-
-with tabs[2]:
-    st.header("每只鸭综合指标")
-    if "individual" in result:
-        st.dataframe(result["individual"].round(4), use_container_width=True)
-
-
-with tabs[3]:
-    st.header("采食行为（TFB / FI / AMS / TFD / AFBD / IMI / FR）")
-    if "feeding" in result:
-        cols = ["Animal_ID", "TFB", "FI_g", "AMS_g", "TFD_sec", "AFBD_sec", "IMI_sec", "FR_g_sec"]
-        cols = [c for c in cols if c in result["feeding"].columns]
-        st.dataframe(result["feeding"][cols].round(4), use_container_width=True)
-    if "bout" in result:
-        st.subheader("单次采食记录")
-        st.dataframe(result["bout"].head(2000), use_container_width=True)
-
-
-with tabs[4]:
-    st.header("生产性能")
-    if "production" in result:
-        cols = ["Animal_ID", "Group", "IBW_kg", "FBW_kg", "Gain_kg", "ADG_g",
-                "ADFI_g", "MBW", "FCR", "RFI", "Feed_Efficiency", "TFB", "FI_g"]
-        cols = [c for c in cols if c in result["production"].columns]
-        st.dataframe(result["production"][cols].round(4), use_container_width=True)
-
-
-with tabs[5]:
-    st.header("HFF / LFF")
-    st.markdown("**本页绘图参数**")
-    c1, c2 = st.columns(2)
-    with c1:
-        hff_palette = st.selectbox("配色方案", list(PALETTES.keys()), index=0, key="hff_pal")
-    with c2:
-        hff_max_n = st.number_input("每类最大记录数", 500, 50000, 5000, 500, key="hff_n")
-
-    if "hff_group_summary" in result and len(result["hff_group_summary"]) > 0:
-        st.subheader("HFF / LFF 分组概况")
-        st.dataframe(result["hff_group_summary"].round(2), use_container_width=True)
-    if "hff_tests" in result and len(result["hff_tests"]) > 0:
-        st.subheader("HFF vs LFF 检验")
-        df = result["hff_tests"].copy()
-        for c in ["Mann_Whitney_P", "T_test_P"]:
-            if c in df.columns:
-                df[c] = df[c].apply(format_p)
-        st.dataframe(df, use_container_width=True)
-    if "hff" in result and len(result["hff"]) > 0:
-        st.subheader("HFF / LFF 分组结果")
-        st.dataframe(result["hff"].round(4), use_container_width=True)
-
-        plot_dat = result["hff"].dropna(subset=["Feed_Frequency_Group"])
-        plot_dat = plot_dat[plot_dat["Feed_Frequency_Group"].isin(["HFF", "LFF"])]
-        if len(plot_dat) > 0:
-            long = plot_dat.melt(id_vars=["Animal_ID", "Feed_Frequency_Group"],
-                                  value_vars=[c for c in ["TFB", "FR_g_sec", "FCR", "RFI"] if c in plot_dat.columns],
-                                  var_name="Indicator", value_name="Value").dropna()
-            if len(long) > 0:
-                pal = seq_colors(hff_palette, 2)
-                fig = px.violin(long, x="Feed_Frequency_Group", y="Value",
-                                color="Feed_Frequency_Group", facet_col="Indicator",
-                                facet_col_wrap=2, box=True, points=False,
-                                color_discrete_map={"HFF": pal[0], "LFF": pal[1]})
-                fig.update_layout(height=650, showlegend=False)
-                st.plotly_chart(fig, use_container_width=True)
-                dl_button(fig, "dl_hff", "hff_lff.png")
-
-
-with tabs[6]:
-    st.header("采食节律")
-    st.markdown("**本页绘图参数**")
-    c1, c2 = st.columns(2)
-    with c1:
-        rhythm_palette = st.selectbox("配色方案", list(PALETTES.keys()), index=0, key="rhythm_pal")
-    with c2:
-        rhythm_multi = st.checkbox("按周使用不同颜色", value=True, key="rhythm_multi")
-
-    if "rhythm" in result and len(result["rhythm"]) > 0:
-        st.subheader("24 小时采食次数（按周）")
-        df = result["rhythm"]
-        fig = px.line(df, x="Hour_Block", y="Mean_Bouts_Per_Duck",
-                      color="Week_Number", markers=True,
-                      color_discrete_sequence=seq_colors(rhythm_palette, df["Week_Number"].nunique()))
-        fig.update_layout(height=600, xaxis_title="Hour of Day",
-                          yaxis_title="Mean Feeding Bouts / Duck")
-        st.plotly_chart(fig, use_container_width=True)
-        dl_button(fig, "dl_rhythm", "rhythm.png")
-
-    if "daily_bouts" in result and len(result["daily_bouts"]) > 0:
-        st.subheader("每日有效访饲次数")
-        fig = px.line(result["daily_bouts"], x="Date", y="Mean_Bouts_Per_Duck", markers=True,
-                      color_discrete_sequence=seq_colors(rhythm_palette, 1))
-        fig.update_layout(height=500)
-        st.plotly_chart(fig, use_container_width=True)
-        dl_button(fig, "dl_daily", "daily_bouts.png")
-
-    if "weekly_bouts" in result and len(result["weekly_bouts"]) > 0:
-        st.subheader("每周访饲次数")
-        fig = px.line(result["weekly_bouts"], x="Date", y="Mean_Bouts_Per_Duck",
-                      color="Week_Number", markers=True,
-                      color_discrete_sequence=seq_colors(rhythm_palette, result["weekly_bouts"]["Week_Number"].nunique()))
-        fig.update_layout(height=500)
-        st.plotly_chart(fig, use_container_width=True)
-        dl_button(fig, "dl_weekly", "weekly_bouts.png")
-
-
-with tabs[7]:
-    st.header("创新行为指标")
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        inno_palette = st.selectbox("散点配色", list(PALETTES.keys()), index=1, key="inno_pal")
-    with c2:
-        phase_palette = st.selectbox("峰值时刻直方图配色", list(PALETTES.keys()), index=2, key="phase_pal")
-    with c3:
-        inno_show_se = st.checkbox("显示回归置信带", value=True, key="inno_se")
-    with c4:
-        inno_line_color = st.text_input("回归线颜色(Hex, 可留空)", "", key="inno_line")
-
-    if "daynight_table" in result:
-        st.subheader("① 昼夜采食分配")
-        st.dataframe(result["daynight_table"].round(4), use_container_width=True)
-
-    if "innovation_merged" in result and len(result["innovation_merged"]) > 0:
-        merged = result["innovation_merged"]
-        pal = seq_colors(inno_palette, 3)
-        line_col = valid_hex(inno_line_color) if inno_line_color.strip() else pal[1]
-
-        dat = merged.dropna(subset=["Day_FI_Ratio", "FCR"]) if {"Day_FI_Ratio", "FCR"}.issubset(merged.columns) else pd.DataFrame()
-        if len(dat) >= 5:
-            r, p = stats.spearmanr(dat["Day_FI_Ratio"], dat["FCR"])
-            fig = px.scatter(dat, x="Day_FI_Ratio", y="FCR",
-                             trendline="ols",
-                             trendline_color_override=line_col,
-                             color_discrete_sequence=[pal[0]])
-            fig.update_traces(marker=dict(size=8, opacity=0.7), selector=dict(mode="markers"))
-            fig.update_layout(height=500, title=f"Spearman r={r:.3f}, P={format_p(p)}, n={len(dat)}")
-            st.plotly_chart(fig, use_container_width=True)
-            dl_button(fig, "dl_dn", "daynight_scatter.png")
-
-        st.subheader("昼夜比 与 生产性能的相关")
-        corr = compute_innovation_corr(merged,
-                                       ["Day_FI_Ratio", "Day_Bout_Ratio", "Day_Night_FI_Ratio",
-                                        "Day_Night_Bout_Ratio", "Day_Avg_Meal", "Night_Avg_Meal"])
-        if len(corr) > 0:
-            corr["Spearman_r"] = corr["Spearman_r"].round(4)
-            corr["P_value"] = corr["P_value"].apply(format_p)
-            st.dataframe(corr, use_container_width=True)
-
-    if "cv_table" in result:
-        st.subheader("② 行为一致性（CV）")
-        st.dataframe(result["cv_table"].round(4), use_container_width=True)
-
-    if "innovation_merged" in result and len(result["innovation_merged"]) > 0:
-        merged = result["innovation_merged"]
-        cv_vars = ["CV_Duration", "CV_FR", "Robust_CV_IMI", "CV_Daily_Bouts", "CV_Daily_FI", "CV_Daily_TFD"]
-        cv_vars = [v for v in cv_vars if v in merged.columns]
-        if cv_vars and "FCR" in merged.columns:
-            plot_dat = merged.melt(id_vars=["Animal_ID", "FCR"], value_vars=cv_vars,
-                                    var_name="CV_Type", value_name="CV_Value").dropna()
-            if len(plot_dat) >= 5:
-                fig = px.scatter(plot_dat, x="CV_Value", y="FCR", facet_col="CV_Type",
-                                 facet_col_wrap=3, trendline="ols",
-                                 color_discrete_sequence=[seq_colors(inno_palette, 1)[0]])
-                fig.update_layout(height=650)
-                st.plotly_chart(fig, use_container_width=True)
-                dl_button(fig, "dl_cv", "cv_fcr.png")
-
-        st.subheader("CV 与 生产性能的相关")
-        corr = compute_innovation_corr(merged, cv_vars)
-        if len(corr) > 0:
-            corr["Spearman_r"] = corr["Spearman_r"].round(4)
-            corr["P_value"] = corr["P_value"].apply(format_p)
-            st.dataframe(corr, use_container_width=True)
-
-    if "cosinor_table" in result:
-        st.subheader("③ 昼夜节律余弦拟合")
-        st.dataframe(result["cosinor_table"].round(4), use_container_width=True)
-
-        if "innovation_merged" in result and len(result["innovation_merged"]) > 0:
-            merged = result["innovation_merged"]
-            if {"Cosinor_A", "FCR"}.issubset(merged.columns):
-                dat = merged.dropna(subset=["Cosinor_A", "FCR"])
-                if len(dat) >= 5:
-                    r, p = stats.spearmanr(dat["Cosinor_A"], dat["FCR"])
-                    pal = seq_colors(inno_palette, 3)
-                    line_col = valid_hex(inno_line_color) if inno_line_color.strip() else pal[1]
-                    fig = px.scatter(dat, x="Cosinor_A", y="FCR", trendline="ols",
-                                     trendline_color_override=line_col,
-                                     color_discrete_sequence=[pal[0]])
-                    fig.update_layout(height=500, title=f"Spearman r={r:.3f}, P={format_p(p)}, n={len(dat)}")
-                    st.plotly_chart(fig, use_container_width=True)
-                    dl_button(fig, "dl_cos", "cosinor_scatter.png")
-
-            if "Peak_Hour" in merged.columns:
-                phase_dat = merged.dropna(subset=["Peak_Hour"])
-                if len(phase_dat) >= 5:
-                    phase_col = seq_colors(phase_palette, 1)[0]
-                    fig = px.histogram(phase_dat, x="Peak_Hour", nbins=24,
-                                       color_discrete_sequence=[phase_col])
-                    fig.update_layout(height=450, xaxis_title="Peak Hour",
-                                      yaxis_title="Number of ducks")
-                    st.plotly_chart(fig, use_container_width=True)
-                    dl_button(fig, "dl_phase", "phase_hist.png")
-
-            st.subheader("余弦参数 与 生产性能的相关")
-            corr = compute_innovation_corr(merged, ["Cosinor_A", "Cosinor_R2", "Cosinor_M", "Peak_Hour"])
-            if len(corr) > 0:
-                corr["Spearman_r"] = corr["Spearman_r"].round(4)
-                corr["P_value"] = corr["P_value"].apply(format_p)
-                st.dataframe(corr, use_container_width=True)
-
-    if "fano_table" in result:
-        st.subheader("④ Fano 聚集指数")
-        st.dataframe(result["fano_table"].round(4), use_container_width=True)
-
-        if "innovation_merged" in result and len(result["innovation_merged"]) > 0:
-            merged = result["innovation_merged"]
-            st.subheader("Fano 与 生产性能的相关")
-            corr = compute_innovation_corr(merged, ["Fano", "Mean_Bouts_Per_Hour", "Var_Bouts_Per_Hour"])
-            if len(corr) > 0:
-                corr["Spearman_r"] = corr["Spearman_r"].round(4)
-                corr["P_value"] = corr["P_value"].apply(format_p)
-                st.dataframe(corr, use_container_width=True)
-
-
-with tabs[8]:
-    st.header("单次采食")
-    st.markdown("**本页绘图参数**")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        bout_palette = st.selectbox("配色方案", list(PALETTES.keys()), index=0, key="bout_pal")
-    with c2:
-        bout_multi = st.checkbox("每周使用不同颜色", value=False, key="bout_multi")
-    with c3:
-        bout_max_n = st.number_input("每类最大记录数", 500, 50000, 5000, 500, key="bout_n")
-    c4, c5 = st.columns(2)
-    with c4:
-        bout_lq = st.number_input("下限分位数(%)", 0.0, 49.0, 1.0, 0.5, key="bout_lq")
-    with c5:
-        bout_uq = st.number_input("上限分位数(%)", 51.0, 100.0, 99.0, 0.5, key="bout_uq")
-
-    if "bout" in result and len(result["bout"]) > 0:
-        bout = result["bout"]
-        pal = seq_colors(bout_palette, max(bout["Week_Number"].nunique(), 1))
-
-        for var, label, fname in [
-            ("FR_g_sec", "采食速率 FR", "fr_violin.png"),
-            ("IMI_sec", "采食间隔 IMI", "imi_violin.png"),
-            ("Feed_Duration_sec", "采食时长", "duration_violin.png"),
-        ]:
-            if var not in bout.columns:
-                continue
-            if bout[var].dropna().empty:
-                continue
-            st.subheader(f"{label}：小提琴图 + 箱线图")
-            dat = bout.dropna(subset=[var]).copy()
-            dat["Plot_Group"] = "Week " + dat["Week_Number"].astype(int).astype(str)
-            lo, hi = np.percentile(dat[var], [bout_lq, bout_uq])
-            plot_dat = dat[(dat[var] >= lo) & (dat[var] <= hi)]
-            fig = px.violin(plot_dat, x="Plot_Group", y=var, box=True, points=False,
-                            color="Plot_Group" if bout_multi else None,
-                            color_discrete_sequence=pal if bout_multi else [pal[0]])
-            fig.update_layout(height=550, showlegend=False, xaxis_title="Week", yaxis_title=label)
-            st.plotly_chart(fig, use_container_width=True)
-            dl_button(fig, f"dl_{var}", fname)
-
-    if "bout" in result and "bout_kw" in selected_modules:
-        st.subheader("Kruskal-Wallis 检验")
-        rows = []
-        for var, label in [("FR_g_sec", "Feeding Rate"),
-                            ("IMI_sec", "Inter-Meal Interval"),
-                            ("Feed_Duration_sec", "Feeding Duration")]:
-            dat = result["bout"].dropna(subset=[var, "Week_Number"])
-            if len(dat) < 3 or dat["Week_Number"].nunique() < 2:
-                rows.append({"指标": label, "Kruskal_Wallis_P": np.nan})
-                continue
-            groups = [g[var].values for _, g in dat.groupby("Week_Number")]
-            try:
-                p = stats.kruskal(*groups).pvalue
-            except Exception:
-                p = np.nan
-            rows.append({"指标": label, "Kruskal_Wallis_P": p})
-        df = pd.DataFrame(rows)
-        df["Kruskal_Wallis_P"] = df["Kruskal_Wallis_P"].apply(format_p)
-        st.dataframe(df, use_container_width=True)
-
-    st.divider()
-    st.header("生长曲线")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        growth_palette = st.selectbox("曲线配色", list(PALETTES.keys()), index=0, key="growth_pal")
-    with c2:
-        growth_multi = st.checkbox("HFF/LFF 用不同颜色", value=True, key="growth_multi")
-    with c3:
-        growth_overall = st.text_input("总体曲线颜色(Hex, 可留空)", "", key="growth_col")
-
-    if "bw_clean" in result and len(result["bw_clean"]) > 0:
-        bw = result["bw_clean"].dropna(subset=["BW_kg", "Experimental_Day"])
-        if len(bw) > 0:
-            daily = bw.sort_values(["Animal_ID", "Date", "Time1"]).groupby(
-                ["Animal_ID", "Date", "Experimental_Day"]).tail(1)
-            overall = daily.groupby("Experimental_Day").agg(
-                Mean_BW_kg=("BW_kg", "mean"),
-                SD_BW_kg=("BW_kg", "std"),
-                N=("BW_kg", "size"),
-            ).reset_index().sort_values("Experimental_Day")
-
-            if len(overall) > 0:
-                st.subheader("总体生长曲线")
-                pal = seq_colors(growth_palette, 1)
-                col = valid_hex(growth_overall) if growth_overall.strip() else pal[0]
-                fig = px.line(overall, x="Experimental_Day", y="Mean_BW_kg", markers=True,
-                              color_discrete_sequence=[col])
-                fig.update_layout(height=550, xaxis_title="Experimental Day",
-                                  yaxis_title="Daily Terminal Body Weight (kg)")
-                st.plotly_chart(fig, use_container_width=True)
-                dl_button(fig, "dl_growth", "growth_overall.png")
-
-            if "production" in result and "Feed_Frequency_Group" in result["production"].columns:
-                st.subheader("HFF / LFF 分组生长曲线")
-                grp_map = result["production"][["Animal_ID", "Feed_Frequency_Group"]]
-                gdat = daily.merge(grp_map, on="Animal_ID", how="left")
-                gdat = gdat[gdat["Feed_Frequency_Group"].isin(["HFF", "LFF"])]
-                gsum = gdat.groupby(["Feed_Frequency_Group", "Experimental_Day"]).agg(
-                    Mean_BW_kg=("BW_kg", "mean")).reset_index().sort_values(["Feed_Frequency_Group", "Experimental_Day"])
-                if len(gsum) > 0:
-                    pal2 = seq_colors(growth_palette, 2)
-                    fig = px.line(gsum, x="Experimental_Day", y="Mean_BW_kg",
-                                  color="Feed_Frequency_Group", markers=True,
-                                  color_discrete_map={"HFF": pal2[0], "LFF": pal2[1]})
-                    fig.update_layout(height=550, xaxis_title="Experimental Day",
-                                      yaxis_title="Daily Terminal Body Weight (kg)")
-                    st.plotly_chart(fig, use_container_width=True)
-                    dl_button(fig, "dl_ggrowth", "growth_by_group.png")
-
-
-with tabs[9]:
-    st.header("每周 FCR")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        wfcr_palette = st.selectbox("配色方案", list(PALETTES.keys()), index=0, key="wfcr_pal")
-    with c2:
-        wfcr_multi = st.checkbox("每周使用不同颜色", value=False, key="wfcr_multi")
-    with c3:
-        wfcr_max_n = st.number_input("每类最大记录数", 500, 50000, 5000, 500, key="wfcr_n")
-    c4, c5 = st.columns(2)
-    with c4:
-        wfcr_lq = st.number_input("下限分位数(%)", 0.0, 49.0, 1.0, 0.5, key="wfcr_lq")
-    with c5:
-        wfcr_uq = st.number_input("上限分位数(%)", 51.0, 100.0, 99.0, 0.5, key="wfcr_uq")
-
-    if "weekly_fcr" in result and len(result["weekly_fcr"]) > 0:
-        dat = result["weekly_fcr"].dropna(subset=["Weekly_FCR"]).copy()
-        if len(dat) > 0:
-            dat["Week"] = "Week " + dat["Week_Number"].astype(int).astype(str)
-            lo, hi = np.percentile(dat["Weekly_FCR"], [wfcr_lq, wfcr_uq])
-            plot_dat = dat[(dat["Weekly_FCR"] >= lo) & (dat["Weekly_FCR"] <= hi)]
-            pal = seq_colors(wfcr_palette, dat["Week"].nunique())
-            fig = px.violin(plot_dat, x="Week", y="Weekly_FCR", box=True, points=False,
-                            color="Week" if wfcr_multi else None,
-                            color_discrete_sequence=pal if wfcr_multi else [pal[0]])
-            fig.update_layout(height=600, showlegend=False)
-            st.plotly_chart(fig, use_container_width=True)
-            dl_button(fig, "dl_wfcr", "weekly_fcr.png")
-
-    if "weekly_fcr_tests" in result:
-        st.subheader("Kruskal-Wallis 检验")
-        df = result["weekly_fcr_tests"].copy()
-        df["P值"] = df["P值"].apply(format_p)
-        st.dataframe(df, use_container_width=True)
-
-    st.divider()
-    st.header("12指标 Spearman 相关矩阵")
-    corr_palette = st.selectbox("热图配色", list(HEAT_PALETTES.keys()), index=0, key="corr_pal")
-
-    if "correlation" in result and result["correlation"] is not None and len(result["correlation"]) > 0:
-        mat = result["correlation"]
-        heat_cols = HEAT_PALETTES[corr_palette]
-        fig = px.imshow(mat.values, x=mat.columns, y=mat.index,
-                        color_continuous_scale=[heat_cols[0], heat_cols[1], heat_cols[2]],
-                        zmin=-1, zmax=1, text_auto=".2f", aspect="auto")
-        fig.update_layout(height=750)
-        st.plotly_chart(fig, use_container_width=True)
-        dl_button(fig, "dl_corr", "correlation.png")
-
-        if "correlation_p" in result:
-            st.subheader("P 值矩阵")
-            st.dataframe(result["correlation_p"].round(4), use_container_width=True)
-
-
-with tabs[10]:
-    st.header("清洗后数据")
-    if "feed_clean" in result:
-        st.subheader("采食数据")
-        st.dataframe(result["feed_clean"].head(2000), use_container_width=True)
-    if "bw_clean" in result:
-        st.subheader("体重数据")
-        st.dataframe(result["bw_clean"].head(2000), use_container_width=True)
-    if "bout" in result:
-        st.subheader("完整单次采食数据")
-        st.dataframe(result["bout"].head(2000), use_container_width=True)
-
-
-with tabs[11]:
-    st.header("Excel 结果导出")
-
-    if not result:
-        st.info("请先在左侧点击 **开始分析**，分析完成后本页会显示导出选项。"
-                "（也可以直接使用侧边栏『⑦ 一键导出』）")
-    else:
-        st.success("✅ 分析已完成。下方可预览导出内容，并进行一键导出 / 分类导出 / CSV 下载。")
-        st.caption("提示：侧边栏『⑦ 一键导出』按钮同样可用，无需停留在本页。")
-
-        st.subheader("① 导出内容预览")
-        preview_rows = []
-        for key in selected_exports:
-            for name, df in _collect_export_sheets(result, key):
-                if df is not None and len(df) > 0:
-                    preview_rows.append({
-                        "导出类别": EXPORT_MAP_KEYS.get(key, key),
-                        "Sheet 名称": name,
-                        "行数": len(df),
-                        "列数": len(df.columns),
-                        "状态": "✅ 有数据",
-                    })
-                else:
-                    preview_rows.append({
-                        "导出类别": EXPORT_MAP_KEYS.get(key, key),
-                        "Sheet 名称": name,
-                        "行数": 0,
-                        "列数": 0,
-                        "状态": "⚠️ 空（该模块未运行或被跳过）",
-                    })
-        if preview_rows:
-            st.dataframe(pd.DataFrame(preview_rows), use_container_width=True)
-        else:
-            st.warning("你还没有选择任何导出项，请到左侧『⑥ Excel 导出项目』勾选。")
-
-        st.subheader("② 一键导出（合并成一个 Excel）")
-        if not selected_exports:
-            st.warning("请在左侧『⑥ Excel 导出项目』勾选至少一个导出项。")
-        else:
-            ts = datetime.today().strftime("%Y%m%d_%H%M%S")
-            try:
-                xls_bytes = build_excel(result, selected_exports, params_info=_params_info())
-                st.download_button(
-                    label=f"📥 导出全部所选（{len(selected_exports)} 个类别）",
-                    data=xls_bytes,
-                    file_name=f"肉鸭分析_V5.1_{ts}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
-                    key="page_dl_all",
-                )
-                st.caption(f"文件大小：约 {len(xls_bytes)/1024:.1f} KB")
-            except Exception as e:
-                st.error(f"合并导出失败：{e}")
-                import traceback
-                st.code(traceback.format_exc())
-
-        st.subheader("③ 按类别单独导出")
-        st.caption("每个类别生成一个独立的 Excel 文件，便于分发给不同的人。")
-        ts2 = datetime.today().strftime("%Y%m%d_%H%M%S")
-        for key in selected_exports:
-            label = EXPORT_MAP_KEYS.get(key, key)
-            try:
-                xls_bytes = build_excel(result, [key], params_info=_params_info())
-                st.download_button(
-                    label=f"📥 {label}",
-                    data=xls_bytes,
-                    file_name=f"肉鸭_{key}_{ts2}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
-                    key=f"page_dl_{key}",
-                )
-            except Exception as e:
-                st.error(f"「{label}」导出失败：{e}")
-
-        with st.expander("④ 附加：核心数据单独下载 CSV（便于快速查看）"):
-            csv_items = [
-                ("个体综合指标", result.get("individual")),
-                ("采食行为", result.get("feeding")),
-                ("生产性能", result.get("production")),
-                ("清洗后采食数据", result.get("feed_clean")),
-                ("清洗后体重数据", result.get("bw_clean")),
-            ]
-            for name, df in csv_items:
-                if df is not None and len(df) > 0:
-                    csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
-                    st.download_button(
-                        f"⬇️ {name}.csv",
-                        data=csv_bytes,
-                        file_name=f"{name}_{ts2}.csv",
-                        mime="text/csv",
-                        key=f"csv_{name}",
-                    )
+    **部署依赖**（requirements.txt）
